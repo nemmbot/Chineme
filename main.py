@@ -40,6 +40,12 @@ from forecasting_tools import (
 dotenv.load_dotenv()
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Model identifiers
+# ---------------------------------------------------------------------------
+_CLAUDE_MODEL = "openrouter/anthropic/claude-sonnet-4-6"
+_GPT_MODEL    = "openrouter/openai/gpt-5.4"
+
 
 class TavilySearcher:
     def __init__(
@@ -93,12 +99,25 @@ class TavilySearcher:
         return await asyncio.to_thread(self._post_json, "https://api.tavily.com/search", payload)
 
 
+# ---------------------------------------------------------------------------
+# Extremization helpers
+# ---------------------------------------------------------------------------
+
 @dataclass
 class ExtremizationConfig:
+    """
+    Conservative floor/ceil preserve Metaculus scoring validity while the
+    logit factor aggressively separates signal from noise.
+
+    Defaults (env-overridable):
+      factor : 1.45   — strong logit push toward confident forecasts
+      floor  : 0.02   — never go below 2 % (avoids log-score blowup)
+      ceil   : 0.98   — never exceed 98 %
+    """
     enabled: bool = True
-    factor: float = 1.25
-    floor: float = 0.01
-    ceil: float = 0.99
+    factor: float = 1.45   # was 1.25 — more aggressive
+    floor: float = 0.02    # was 0.01 — slightly more conservative
+    ceil: float = 0.98     # was 0.99 — slightly more conservative
 
 
 def _logit(p: float) -> float:
@@ -115,6 +134,7 @@ def _sigmoid(x: float) -> float:
 
 
 def extremize_probability(p: float, cfg: ExtremizationConfig) -> float:
+    """Push probability away from 0.5 via logit scaling, then clamp."""
     if not cfg.enabled:
         return max(cfg.floor, min(cfg.ceil, p))
     x = _logit(p) * cfg.factor
@@ -122,7 +142,19 @@ def extremize_probability(p: float, cfg: ExtremizationConfig) -> float:
     return max(cfg.floor, min(cfg.ceil, out))
 
 
-class SpringTemplateBot2026(ForecastBot):
+# ---------------------------------------------------------------------------
+# Main bot class — Chineme
+# ---------------------------------------------------------------------------
+
+class Chineme(ForecastBot):
+    """
+    Chineme — a conservative-yet-extremizing superforecaster bot.
+
+    Primary reasoning  : Claude Sonnet 4.6  (via OpenRouter)
+    Secondary / parser : GPT-5.4            (via OpenRouter)
+    Extremization      : logit factor 1.45, floor 0.02, ceil 0.98
+    """
+
     _max_concurrent_questions = 1
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
     _structure_output_validation_samples = 2
@@ -136,19 +168,28 @@ class SpringTemplateBot2026(ForecastBot):
     def __init__(self, *args, **kwargs):
         llms = kwargs.pop("llms", None)
         if llms is None:
-            free_model = GeneralLlm(
-                model="openrouter/openrouter/free",
-                temperature=0.2,
-                timeout=45,
+            # Primary: Claude Sonnet 4.6 for deep reasoning (low temperature = conservative)
+            claude_llm = GeneralLlm(
+                model=_CLAUDE_MODEL,
+                temperature=0.15,
+                timeout=60,
+                allowed_tries=2,
+            )
+            # Secondary: GPT-5.4 for parsing / structured output
+            gpt_llm = GeneralLlm(
+                model=_GPT_MODEL,
+                temperature=0.15,
+                timeout=60,
                 allowed_tries=2,
             )
             llms = {
-                "default": free_model,
-                "summarizer": free_model,
-                "researcher": free_model,
-                "parser": free_model,
+                "default":    claude_llm,   # main forecasting reasoning
+                "summarizer": claude_llm,   # research summarization
+                "researcher": gpt_llm,      # query decomposition
+                "parser":     gpt_llm,      # structured output parsing
             }
         super().__init__(*args, llms=llms, **kwargs)
+
         self._research_cache: dict[str, str] = {}
         self._tavily_api_key = os.getenv("TAVILY_API_KEY", "").strip()
         self._tavily = TavilySearcher(
@@ -162,10 +203,14 @@ class SpringTemplateBot2026(ForecastBot):
         )
         self._ext_cfg = ExtremizationConfig(
             enabled=os.getenv("EXTREMIZE_ENABLED", "true").lower() in ["1", "true", "yes", "y"],
-            factor=float(os.getenv("EXTREMIZE_FACTOR", "1.25")),
-            floor=float(os.getenv("EXTREMIZE_FLOOR", "0.01")),
-            ceil=float(os.getenv("EXTREMIZE_CEIL", "0.99")),
+            factor=float(os.getenv("EXTREMIZE_FACTOR", "1.45")),
+            floor=float(os.getenv("EXTREMIZE_FLOOR", "0.02")),
+            ceil=float(os.getenv("EXTREMIZE_CEIL", "0.98")),
         )
+
+    # ------------------------------------------------------------------
+    # Throttling
+    # ------------------------------------------------------------------
 
     async def _throttle_search(self) -> None:
         now = time.time()
@@ -184,6 +229,10 @@ class SpringTemplateBot2026(ForecastBot):
     async def _llm_invoke(self, model_key: str, prompt: str) -> str:
         await self._throttle_llm()
         return await self.get_llm(model_key, "llm").invoke(prompt)
+
+    # ------------------------------------------------------------------
+    # Research
+    # ------------------------------------------------------------------
 
     async def _decompose_question(self, question: MetaculusQuestion) -> list[str]:
         prompt = clean_indents(
@@ -230,8 +279,8 @@ class SpringTemplateBot2026(ForecastBot):
         items = results.get("results", []) or []
         lines = [f"Query: {query}"]
         for r in items[: self._tavily.max_results]:
-            title = (r.get("title") or "").strip()
-            url = (r.get("url") or "").strip()
+            title   = (r.get("title")   or "").strip()
+            url     = (r.get("url")     or "").strip()
             snippet = (r.get("content") or "").strip()
             if title or url or snippet:
                 lines.append(f"- {title}".strip())
@@ -250,7 +299,7 @@ class SpringTemplateBot2026(ForecastBot):
             f"metaforecast {question.question_text}",
             f"prediction market odds {question.question_text}",
         ]
-        merged = []
+        merged: list[str] = []
         for q in queries + market_queries:
             q2 = q.strip()
             if q2 and q2 not in merged:
@@ -310,37 +359,44 @@ class SpringTemplateBot2026(ForecastBot):
             )
             try:
                 summary = await self._llm_invoke("summarizer", summarize_prompt)
-                final = clean_indents(
-                    f"""
-                    {base}
+                if tavily_bundle:
+                    final = clean_indents(
+                        f"""
+                        {base}
 
-                    --- RESEARCH SUMMARY ---
-                    {summary}
+                        --- RESEARCH SUMMARY ---
+                        {summary}
 
-                    --- RAW RESEARCH SNIPPETS ---
-                    {tavily_bundle}
-                    """
-                ).strip() if tavily_bundle else clean_indents(
-                    f"""
-                    {base}
+                        --- RAW RESEARCH SNIPPETS ---
+                        {tavily_bundle}
+                        """
+                    ).strip()
+                else:
+                    final = clean_indents(
+                        f"""
+                        {base}
 
-                    --- RESEARCH SUMMARY ---
-                    {summary}
-                    """
-                ).strip()
+                        --- RESEARCH SUMMARY ---
+                        {summary}
+                        """
+                    ).strip()
             except Exception:
                 final = research
 
             self._research_cache[question.page_url] = final
-            logger.info(f"Found Research for URL {question.page_url}:\n{final}")
+            logger.info(f"[Chineme] Research for {question.page_url}:\n{final}")
             return final
+
+    # ------------------------------------------------------------------
+    # Binary
+    # ------------------------------------------------------------------
 
     async def _run_forecast_on_binary(
         self, question: BinaryQuestion, research: str
     ) -> ReasonedPrediction[float]:
         prompt = clean_indents(
             f"""
-            You are a professional forecaster.
+            You are Chineme, a professional superforecaster.
 
             Question:
             {question.question_text}
@@ -365,6 +421,7 @@ class SpringTemplateBot2026(ForecastBot):
             (d) A brief Yes scenario
 
             Weight the status quo heavily unless there is strong evidence of change.
+            Be conservative in your reasoning but express genuine confidence when evidence warrants it.
             {self._get_conditional_disclaimer_if_necessary(question)}
 
             End with: "Probability: ZZ%" (0-100)
@@ -378,22 +435,28 @@ class SpringTemplateBot2026(ForecastBot):
         prompt: str,
     ) -> ReasonedPrediction[float]:
         reasoning = await self._llm_invoke("default", prompt)
-        logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
+        logger.info(f"[Chineme] Reasoning for {question.page_url}: {reasoning}")
         binary_prediction: BinaryPrediction = await structure_output(
             reasoning,
             BinaryPrediction,
             model=self.get_llm("parser", "llm"),
             num_validation_samples=self._structure_output_validation_samples,
         )
-        decimal_pred = max(0.01, min(0.99, binary_prediction.prediction_in_decimal))
-        return ReasonedPrediction(prediction_value=decimal_pred, reasoning=reasoning)
+        raw_p = max(0.01, min(0.99, binary_prediction.prediction_in_decimal))
+        # Extremize individual binary prediction before returning
+        extremized_p = extremize_probability(raw_p, self._ext_cfg)
+        return ReasonedPrediction(prediction_value=extremized_p, reasoning=reasoning)
+
+    # ------------------------------------------------------------------
+    # Multiple choice
+    # ------------------------------------------------------------------
 
     async def _run_forecast_on_multiple_choice(
         self, question: MultipleChoiceQuestion, research: str
     ) -> ReasonedPrediction[PredictedOptionList]:
         prompt = clean_indents(
             f"""
-            You are a professional forecaster.
+            You are Chineme, a professional superforecaster.
 
             Question:
             {question.question_text}
@@ -420,6 +483,7 @@ class SpringTemplateBot2026(ForecastBot):
 
             {self._get_conditional_disclaimer_if_necessary(question)}
             Put extra weight on status quo, but leave some probability mass for surprises.
+            Be conservative in reasoning; express genuine confidence where evidence supports it.
 
             End with probabilities in this exact order {question.options}:
             Option_A: Probability_A
@@ -441,7 +505,7 @@ class SpringTemplateBot2026(ForecastBot):
             """
         )
         reasoning = await self._llm_invoke("default", prompt)
-        logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
+        logger.info(f"[Chineme] Reasoning for {question.page_url}: {reasoning}")
         predicted_option_list: PredictedOptionList = await structure_output(
             text_to_structure=reasoning,
             output_type=PredictedOptionList,
@@ -453,6 +517,10 @@ class SpringTemplateBot2026(ForecastBot):
             prediction_value=predicted_option_list, reasoning=reasoning
         )
 
+    # ------------------------------------------------------------------
+    # Numeric
+    # ------------------------------------------------------------------
+
     async def _run_forecast_on_numeric(
         self, question: NumericQuestion, research: str
     ) -> ReasonedPrediction[NumericDistribution]:
@@ -461,7 +529,7 @@ class SpringTemplateBot2026(ForecastBot):
         )
         prompt = clean_indents(
             f"""
-            You are a professional forecaster.
+            You are Chineme, a professional superforecaster.
 
             Question:
             {question.question_text}
@@ -496,7 +564,7 @@ class SpringTemplateBot2026(ForecastBot):
             (f) High unexpected scenario
 
             {self._get_conditional_disclaimer_if_necessary(question)}
-            Use wide 90/10 intervals.
+            Use wide 90/10 intervals. Be conservative; express genuine confidence where warranted.
 
             End with:
             Percentile 10: XX
@@ -515,7 +583,7 @@ class SpringTemplateBot2026(ForecastBot):
         prompt: str,
     ) -> ReasonedPrediction[NumericDistribution]:
         reasoning = await self._llm_invoke("default", prompt)
-        logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
+        logger.info(f"[Chineme] Reasoning for {question.page_url}: {reasoning}")
         parsing_instructions = clean_indents(
             f"""
             Parse a numeric percentile forecast for: "{question.question_text}"
@@ -534,6 +602,10 @@ class SpringTemplateBot2026(ForecastBot):
         prediction = NumericDistribution.from_question(percentile_list, question)
         return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning)
 
+    # ------------------------------------------------------------------
+    # Date
+    # ------------------------------------------------------------------
+
     async def _run_forecast_on_date(
         self, question: DateQuestion, research: str
     ) -> ReasonedPrediction[NumericDistribution]:
@@ -542,7 +614,7 @@ class SpringTemplateBot2026(ForecastBot):
         )
         prompt = clean_indents(
             f"""
-            You are a professional forecaster.
+            You are Chineme, a professional superforecaster.
 
             Question:
             {question.question_text}
@@ -575,7 +647,7 @@ class SpringTemplateBot2026(ForecastBot):
             (f) Late unexpected scenario
 
             {self._get_conditional_disclaimer_if_necessary(question)}
-            Use wide 90/10 intervals.
+            Use wide 90/10 intervals. Be conservative; express genuine confidence where warranted.
 
             End with:
             Percentile 10: YYYY-MM-DD
@@ -594,7 +666,7 @@ class SpringTemplateBot2026(ForecastBot):
         prompt: str,
     ) -> ReasonedPrediction[NumericDistribution]:
         reasoning = await self._llm_invoke("default", prompt)
-        logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
+        logger.info(f"[Chineme] Reasoning for {question.page_url}: {reasoning}")
         parsing_instructions = clean_indents(
             f"""
             Parse a date percentile forecast for: "{question.question_text}"
@@ -609,7 +681,6 @@ class SpringTemplateBot2026(ForecastBot):
             additional_instructions=parsing_instructions,
             num_validation_samples=self._structure_output_validation_samples,
         )
-
         percentile_list = [
             Percentile(
                 percentile=percentile.percentile,
@@ -619,6 +690,10 @@ class SpringTemplateBot2026(ForecastBot):
         ]
         prediction = NumericDistribution.from_question(percentile_list, question)
         return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning)
+
+    # ------------------------------------------------------------------
+    # Bound helpers
+    # ------------------------------------------------------------------
 
     def _create_upper_and_lower_bound_messages(
         self, question: NumericQuestion | DateQuestion
@@ -643,15 +718,29 @@ class SpringTemplateBot2026(ForecastBot):
             raise ValueError()
 
         if question.open_upper_bound:
-            upper_bound_message = f"The question creator thinks the number is likely not higher than {upper_bound_number} {unit_of_measure}."
+            upper_bound_message = (
+                f"The question creator thinks the number is likely not higher than "
+                f"{upper_bound_number} {unit_of_measure}."
+            )
         else:
-            upper_bound_message = f"The outcome can not be higher than {upper_bound_number} {unit_of_measure}."
+            upper_bound_message = (
+                f"The outcome can not be higher than {upper_bound_number} {unit_of_measure}."
+            )
 
         if question.open_lower_bound:
-            lower_bound_message = f"The question creator thinks the number is likely not lower than {lower_bound_number} {unit_of_measure}."
+            lower_bound_message = (
+                f"The question creator thinks the number is likely not lower than "
+                f"{lower_bound_number} {unit_of_measure}."
+            )
         else:
-            lower_bound_message = f"The outcome can not be lower than {lower_bound_number} {unit_of_measure}."
+            lower_bound_message = (
+                f"The outcome can not be lower than {lower_bound_number} {unit_of_measure}."
+            )
         return upper_bound_message, lower_bound_message
+
+    # ------------------------------------------------------------------
+    # Conditional
+    # ------------------------------------------------------------------
 
     async def _run_forecast_on_conditional(
         self, question: ConditionalQuestion, research: str
@@ -668,6 +757,13 @@ class SpringTemplateBot2026(ForecastBot):
         no_info, full_research = await self._get_question_prediction_info(
             question.question_no, full_research, "no"
         )
+
+        # Extremize binary sub-predictions inside conditionals
+        for info in [parent_info, child_info, yes_info, no_info]:
+            pv = getattr(info, "prediction_value", None)
+            if isinstance(pv, float):
+                info.prediction_value = extremize_probability(pv, self._ext_cfg)  # type: ignore[attr-defined]
+
         full_reasoning = clean_indents(
             f"""
             ## Parent Question Reasoning
@@ -682,9 +778,9 @@ class SpringTemplateBot2026(ForecastBot):
         ).strip()
         full_prediction = ConditionalPrediction(
             parent=parent_info.prediction_value,  # type: ignore
-            child=child_info.prediction_value,  # type: ignore
+            child=child_info.prediction_value,    # type: ignore
             prediction_yes=yes_info.prediction_value,  # type: ignore
-            prediction_no=no_info.prediction_value,  # type: ignore
+            prediction_no=no_info.prediction_value,    # type: ignore
         )
         return ReasonedPrediction(
             reasoning=full_reasoning, prediction_value=full_prediction
@@ -749,19 +845,24 @@ class SpringTemplateBot2026(ForecastBot):
         return clean_indents(
             """
             You are given a conditional question with a parent and child.
-            Forecast ONLY the CHILD question given the parent’s resolution.
+            Forecast ONLY the CHILD question given the parent's resolution.
             Do not re-forecast the parent.
             """
         ).strip()
 
+    # ------------------------------------------------------------------
+    # Extremization — top-level sweep
+    # ------------------------------------------------------------------
+
     def _extremize_report_if_binary(self, report: Any) -> None:
+        """Apply extremization to any float probability found on a report object."""
         try:
             pv = getattr(report, "prediction_value", None)
             if isinstance(pv, float):
                 setattr(report, "prediction_value", extremize_probability(pv, self._ext_cfg))
             pred = getattr(report, "prediction", None)
             if isinstance(pred, float):
-                setattr(pred, "prediction", extremize_probability(pred, self._ext_cfg))
+                setattr(report, "prediction", extremize_probability(pred, self._ext_cfg))
         except Exception:
             return
 
@@ -783,6 +884,10 @@ class SpringTemplateBot2026(ForecastBot):
         return reports
 
 
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
 if __name__ == "__main__":
     logging.basicConfig(
         level=logging.INFO,
@@ -793,7 +898,7 @@ if __name__ == "__main__":
     litellm_logger.setLevel(logging.WARNING)
     litellm_logger.propagate = False
 
-    parser = argparse.ArgumentParser(description="Run the TemplateBot forecasting system")
+    parser = argparse.ArgumentParser(description="Run Chineme — the superforecaster bot")
     parser.add_argument(
         "--mode",
         type=str,
@@ -804,7 +909,7 @@ if __name__ == "__main__":
     run_mode: Literal["tournament", "metaculus_cup", "test_questions"] = args.mode
     assert run_mode in ["tournament", "metaculus_cup", "test_questions"]
 
-    template_bot = SpringTemplateBot2026(
+    chineme = Chineme(
         research_reports_per_question=1,
         predictions_per_research_report=3,
         use_research_summary_to_forecast=False,
@@ -815,30 +920,33 @@ if __name__ == "__main__":
     )
 
     client = MetaculusClient()
+
     if run_mode == "tournament":
         seasonal_tournament_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
+            chineme.forecast_on_tournament(
                 client.CURRENT_AI_COMPETITION_ID, return_exceptions=True
             )
         )
         minibench_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
+            chineme.forecast_on_tournament(
                 client.CURRENT_MINIBENCH_ID, return_exceptions=True
             )
         )
         market_pulse_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
+            chineme.forecast_on_tournament(
                 "market-pulse-26q1", return_exceptions=True
             )
         )
         forecast_reports = seasonal_tournament_reports + minibench_reports + market_pulse_reports
+
     elif run_mode == "metaculus_cup":
-        template_bot.skip_previously_forecasted_questions = False
+        chineme.skip_previously_forecasted_questions = False
         forecast_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
+            chineme.forecast_on_tournament(
                 client.CURRENT_METACULUS_CUP_ID, return_exceptions=True
             )
         )
+
     elif run_mode == "test_questions":
         EXAMPLE_QUESTIONS = [
             "https://www.metaculus.com/questions/578/human-extinction-by-2100/",
@@ -846,8 +954,13 @@ if __name__ == "__main__":
             "https://www.metaculus.com/questions/22427/number-of-new-leading-ai-labs/",
             "https://www.metaculus.com/c/diffusion-community/38880/how-many-us-labor-strikes-due-to-ai-in-2029/",
         ]
-        template_bot.skip_previously_forecasted_questions = False
-        questions = [client.get_question_by_url(question_url) for question_url in EXAMPLE_QUESTIONS]
-        forecast_reports = asyncio.run(template_bot.forecast_questions(questions, return_exceptions=True))
+        chineme.skip_previously_forecasted_questions = False
+        questions = [
+            client.get_question_by_url(question_url)
+            for question_url in EXAMPLE_QUESTIONS
+        ]
+        forecast_reports = asyncio.run(
+            chineme.forecast_questions(questions, return_exceptions=True)
+        )
 
-    template_bot.log_report_summary(forecast_reports)
+    chineme.log_report_summary(forecast_reports)
