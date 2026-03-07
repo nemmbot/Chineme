@@ -110,14 +110,14 @@ class ExtremizationConfig:
     logit factor aggressively separates signal from noise.
 
     Defaults (env-overridable):
-      factor : 1.45   — strong logit push toward confident forecasts
-      floor  : 0.02   — never go below 2 % (avoids log-score blowup)
-      ceil   : 0.98   — never exceed 98 %
+      factor : 1.45   â€” strong logit push toward confident forecasts
+      floor  : 0.02   â€” never go below 2 % (avoids log-score blowup)
+      ceil   : 0.98   â€” never exceed 98 %
     """
     enabled: bool = True
-    factor: float = 1.45   # was 1.25 — more aggressive
-    floor: float = 0.02    # was 0.01 — slightly more conservative
-    ceil: float = 0.98     # was 0.99 — slightly more conservative
+    factor: float = 1.45   # was 1.25 â€” more aggressive
+    floor: float = 0.02    # was 0.01 â€” slightly more conservative
+    ceil: float = 0.98     # was 0.99 â€” slightly more conservative
 
 
 def _logit(p: float) -> float:
@@ -143,12 +143,12 @@ def extremize_probability(p: float, cfg: ExtremizationConfig) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Main bot class — Chineme
+# Main bot class â€” Chineme
 # ---------------------------------------------------------------------------
 
 class Chineme(ForecastBot):
     """
-    Chineme — a conservative-yet-extremizing superforecaster bot.
+    Chineme â€” a conservative-yet-extremizing superforecaster bot.
 
     Primary reasoning  : Claude Sonnet 4.6  (via OpenRouter)
     Secondary / parser : GPT-5.4            (via OpenRouter)
@@ -229,6 +229,58 @@ class Chineme(ForecastBot):
     async def _llm_invoke(self, model_key: str, prompt: str) -> str:
         await self._throttle_llm()
         return await self.get_llm(model_key, "llm").invoke(prompt)
+
+    # ------------------------------------------------------------------
+    # Superforecasting heuristics â€” injected into every forecast prompt
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _superforecasting_preamble() -> str:
+        """
+        A compact, reusable block of superforecasting heuristics drawn from
+        Tetlock & Gardner's research and Good Judgment Project best practices.
+        Injected at the top of every forecast prompt so Chineme reasons like
+        a disciplined superforecaster before committing to a number.
+        """
+        return clean_indents(
+            """
+            ## Superforecasting Protocol â€” follow every step before giving a number
+
+            **1. Reference class first (outside view)**
+            Identify the broadest reference class this question belongs to.
+            What fraction of similar past questions resolved YES (or at the predicted value)?
+            Anchor your initial estimate to that base rate.
+
+            **2. Inside view â€” case-specific evidence**
+            Now consider what makes THIS case different from the reference class:
+            - Causal drivers pushing toward YES / a higher value
+            - Causal drivers pushing toward NO / a lower value
+            - Key uncertainties or unknowns that could flip the outcome
+
+            **3. Adjust for scope and time horizon**
+            - Longer time horizons generally mean more regression to base rates.
+            - Short horizons with strong status-quo momentum should reflect that inertia.
+
+            **4. Check for cognitive biases**
+            - Availability bias: Am I over-weighting vivid recent news?
+            - Anchoring: Am I stuck on the first number I thought of?
+            - Conjunction fallacy: Are my scenario chains too detailed/specific?
+            - Overconfidence: Is my interval wide enough given genuine uncertainty?
+
+            **5. Seek disconfirming evidence**
+            What would most strongly argue AGAINST your current lean?
+            Has that evidence been adequately weighted?
+
+            **6. Synthesise: blend outside view + inside view**
+            Start from the base rate, then adjust â€” usually by less than feels natural.
+            Only move far from the base rate if you have strong, specific, reliable evidence.
+
+            **7. Express calibrated confidence**
+            - Near 50 %: high genuine uncertainty, not laziness.
+            - Near 5 % or 95 %: only if evidence is overwhelming AND base rate supports it.
+            - Avoid round numbers (25 %, 50 %, 75 %) unless the evidence truly warrants them.
+            """
+        ).strip()
 
     # ------------------------------------------------------------------
     # Research
@@ -398,6 +450,10 @@ class Chineme(ForecastBot):
             f"""
             You are Chineme, a professional superforecaster.
 
+            {self._superforecasting_preamble()}
+
+            ---
+
             Question:
             {question.question_text}
 
@@ -414,14 +470,17 @@ class Chineme(ForecastBot):
 
             Today is {datetime.now().strftime("%Y-%m-%d")}.
 
-            Before answering write:
-            (a) Time left until resolution
-            (b) Status quo outcome if nothing changed
-            (c) A brief No scenario
-            (d) A brief Yes scenario
+            Now reason step-by-step following the Superforecasting Protocol above:
+            (a) Reference class and base rate
+            (b) Time left until resolution
+            (c) Status quo outcome if nothing changes (outside view anchor)
+            (d) Inside-view: key YES drivers
+            (e) Inside-view: key NO drivers
+            (f) Bias check â€” what am I most likely wrong about?
+            (g) Final synthesis: blend outside + inside view
 
-            Weight the status quo heavily unless there is strong evidence of change.
-            Be conservative in your reasoning but express genuine confidence when evidence warrants it.
+            Weight the status quo heavily unless there is strong, specific evidence of change.
+            Be conservative in reasoning but express genuine confidence when the evidence warrants it.
             {self._get_conditional_disclaimer_if_necessary(question)}
 
             End with: "Probability: ZZ%" (0-100)
@@ -458,6 +517,10 @@ class Chineme(ForecastBot):
             f"""
             You are Chineme, a professional superforecaster.
 
+            {self._superforecasting_preamble()}
+
+            ---
+
             Question:
             {question.question_text}
 
@@ -476,13 +539,17 @@ class Chineme(ForecastBot):
 
             Today is {datetime.now().strftime("%Y-%m-%d")}.
 
-            Before answering write:
-            (a) Time left until resolution
-            (b) Status quo outcome if nothing changed
-            (c) A plausible unexpected outcome
+            Now reason step-by-step following the Superforecasting Protocol above:
+            (a) Reference class: historically, how often does each option type win in similar questions?
+            (b) Time left until resolution
+            (c) Status quo anchor: which option does the current trajectory favour?
+            (d) Inside-view drivers that could shift away from the status quo option
+            (e) Plausible surprise outcome and why it shouldn't be assigned zero probability
+            (f) Bias check â€” am I clustering too much probability on one option?
 
             {self._get_conditional_disclaimer_if_necessary(question)}
-            Put extra weight on status quo, but leave some probability mass for surprises.
+            Put extra weight on the status quo option, but leave meaningful probability mass for surprises.
+            Avoid assigning 0 % to any option unless it is logically impossible.
             Be conservative in reasoning; express genuine confidence where evidence supports it.
 
             End with probabilities in this exact order {question.options}:
@@ -531,6 +598,10 @@ class Chineme(ForecastBot):
             f"""
             You are Chineme, a professional superforecaster.
 
+            {self._superforecasting_preamble()}
+
+            ---
+
             Question:
             {question.question_text}
 
@@ -555,16 +626,19 @@ class Chineme(ForecastBot):
             - No scientific notation
             - Percentiles must be strictly increasing
 
-            Before answering write:
-            (a) Time left
-            (b) Outcome if nothing changed
-            (c) Outcome if trend continued
-            (d) Expert/market expectations (if any)
-            (e) Low unexpected scenario
-            (f) High unexpected scenario
+            Now reason step-by-step following the Superforecasting Protocol above:
+            (a) Reference class and historical base rate for this type of quantity
+            (b) Time left until resolution
+            (c) Status quo / trend-continuation anchor (outside view)
+            (d) Inside-view: factors that could push the value higher than the trend
+            (e) Inside-view: factors that could push the value lower than the trend
+            (f) Expert or market expectations (if found in research)
+            (g) Tail scenarios: extreme low and extreme high (use these to calibrate your 10th/90th)
+            (h) Bias check â€” are my intervals too narrow (overconfidence)?
 
             {self._get_conditional_disclaimer_if_necessary(question)}
-            Use wide 90/10 intervals. Be conservative; express genuine confidence where warranted.
+            Use wide 90/10 intervals to reflect genuine uncertainty.
+            Be conservative in reasoning; express genuine confidence where evidence supports it.
 
             End with:
             Percentile 10: XX
@@ -616,6 +690,10 @@ class Chineme(ForecastBot):
             f"""
             You are Chineme, a professional superforecaster.
 
+            {self._superforecasting_preamble()}
+
+            ---
+
             Question:
             {question.question_text}
 
@@ -636,18 +714,21 @@ class Chineme(ForecastBot):
 
             Formatting:
             - Dates must be YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ
-            - Percentiles must be chronological and increasing
+            - Percentiles must be chronological and strictly increasing
 
-            Before answering write:
-            (a) Time left
-            (b) Outcome if nothing changed
-            (c) Outcome if trend continued
-            (d) Expert/market expectations (if any)
-            (e) Early unexpected scenario
-            (f) Late unexpected scenario
+            Now reason step-by-step following the Superforecasting Protocol above:
+            (a) Reference class: how long do similar events/processes historically take?
+            (b) Time already elapsed and current pace (outside view anchor)
+            (c) Status quo / trend-continuation scenario
+            (d) Inside-view: factors that could accelerate the timeline
+            (e) Inside-view: factors that could delay the timeline
+            (f) Expert or market expectations on timing (if found in research)
+            (g) Tail scenarios: unusually early and unusually late (calibrate 10th/90th)
+            (h) Bias check â€” am I anchoring too tightly to the most salient date?
 
             {self._get_conditional_disclaimer_if_necessary(question)}
-            Use wide 90/10 intervals. Be conservative; express genuine confidence where warranted.
+            Use wide 90/10 intervals to reflect genuine timing uncertainty.
+            Be conservative in reasoning; express genuine confidence where evidence supports it.
 
             End with:
             Percentile 10: YYYY-MM-DD
@@ -851,7 +932,7 @@ class Chineme(ForecastBot):
         ).strip()
 
     # ------------------------------------------------------------------
-    # Extremization — top-level sweep
+    # Extremization â€” top-level sweep
     # ------------------------------------------------------------------
 
     def _extremize_report_if_binary(self, report: Any) -> None:
@@ -898,7 +979,7 @@ if __name__ == "__main__":
     litellm_logger.setLevel(logging.WARNING)
     litellm_logger.propagate = False
 
-    parser = argparse.ArgumentParser(description="Run Chineme — the superforecaster bot")
+    parser = argparse.ArgumentParser(description="Run Chineme â€” the superforecaster bot")
     parser.add_argument(
         "--mode",
         type=str,
