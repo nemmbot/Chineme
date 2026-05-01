@@ -45,6 +45,17 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 _CLAUDE_MODEL = "openrouter/anthropic/claude-sonnet-4-6"
 _GPT_MODEL    = "openrouter/openai/gpt-5.4"
+_OPENROUTER_PERPLEXITY_MODEL = "openrouter/perplexity"
+
+
+def _post_json(url: str, payload: dict[str, Any], headers: dict[str, str] | None = None, timeout_s: int = 30) -> dict[str, Any]:
+    data = json.dumps(payload).encode("utf-8")
+    headers = headers or {}
+    headers.setdefault("Content-Type", "application/json")
+    req = Request(url, data=data, headers=headers, method="POST")
+    with urlopen(req, timeout=timeout_s) as resp:
+        raw = resp.read().decode("utf-8", errors="replace")
+    return json.loads(raw)
 
 
 class TavilySearcher:
@@ -192,6 +203,9 @@ class Chineme(ForecastBot):
 
         self._research_cache: dict[str, str] = {}
         self._tavily_api_key = os.getenv("TAVILY_API_KEY", "").strip()
+        self._openrouter_api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+        self._perplexity_api_key = os.getenv("PERPLEXITY_API_KEY", "").strip()
+        self._sonar_pro_api_key = os.getenv("SONAR_PRO_API_KEY", "").strip()
         self._tavily = TavilySearcher(
             api_key=self._tavily_api_key,
             max_results=6,
@@ -342,6 +356,116 @@ class Chineme(ForecastBot):
                     lines.append(f"  Notes: {snippet}")
         return "\n".join(lines).strip()
 
+    async def _openrouter_model_research(self, question: MetaculusQuestion, model: str, label: str) -> str:
+        if not self._openrouter_api_key:
+            return ""
+        prompt = clean_indents(
+            f"""
+            You are a research assistant.
+            Search for the most relevant evidence, data, and market signals for the forecasting question below.
+            Return a concise, evidence-focused summary with any useful citations or indicators.
+
+            Question:
+            {question.question_text}
+            """
+        ).strip()
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": "You are a helpful research assistant for forecasting."},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.2,
+            "max_tokens": 650,
+        }
+        try:
+            response = await asyncio.to_thread(
+                _post_json,
+                "https://openrouter.ai/v1/chat/completions",
+                payload,
+                {"Authorization": f"Bearer {self._openrouter_api_key}"},
+                40,
+            )
+            return (
+                response.get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", "")
+                .strip()
+            )
+        except Exception as exc:
+            return f"OpenRouter {label} error: {type(exc).__name__}: {exc}"
+
+    async def _perplexity_research(self, question: MetaculusQuestion) -> str:
+        if not self._perplexity_api_key:
+            return ""
+        prompt = clean_indents(
+            f"""
+            Use your search and evidence-gathering capability to answer the forecasting question below.
+            Provide the most relevant data, market signals, and summary evidence.
+
+            Question:
+            {question.question_text}
+            """
+        ).strip()
+        payload = {
+            "model": "llama-3.1-sonar-huge-128k-online",
+            "messages": [
+                {"role": "system", "content": "You are a research assistant with access to Perplexity search."},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.2,
+            "stream": False,
+        }
+        try:
+            response = await asyncio.to_thread(
+                _post_json,
+                "https://api.perplexity.ai/chat/completions",
+                payload,
+                {"Authorization": f"Bearer {self._perplexity_api_key}"},
+                40,
+            )
+            return (
+                response.get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", "")
+                .strip()
+            )
+        except Exception as exc:
+            return f"Perplexity error: {type(exc).__name__}: {exc}"
+
+    async def _sonar_pro_research(self, question: MetaculusQuestion) -> str:
+        if not self._sonar_pro_api_key:
+            return ""
+        payload = {
+            "query": question.question_text,
+            "top_k": 5,
+        }
+        try:
+            response = await asyncio.to_thread(
+                _post_json,
+                "https://api.sonar.so/v1/search",
+                payload,
+                {"Authorization": f"Bearer {self._sonar_pro_api_key}"},
+                40,
+            )
+            items = response.get("results") or response.get("data") or []
+            lines = [f"Query: {question.question_text}"]
+            for item in items[:5]:
+                title = (item.get("title") or item.get("name") or "").strip()
+                url = (item.get("url") or item.get("link") or "").strip()
+                snippet = (item.get("snippet") or item.get("summary") or "").strip()
+                if title or url or snippet:
+                    lines.append(f"- {title}".strip())
+                    if url:
+                        lines.append(f"  URL: {url}")
+                    if snippet:
+                        lines.append(f"  Notes: {snippet}")
+            if len(lines) == 1:
+                return "No Sonar Pro results returned."
+            return "\n".join(lines).strip()
+        except Exception as exc:
+            return f"Sonar Pro error: {type(exc).__name__}: {exc}"
+
     async def _tavily_research_bundle(self, question: MetaculusQuestion) -> str:
         if not self._tavily_api_key:
             return ""
@@ -386,14 +510,39 @@ class Chineme(ForecastBot):
                 """
             ).strip()
 
-            tavily_bundle = await self._tavily_research_bundle(question)
-            if tavily_bundle:
+            research_tasks = [
+                asyncio.create_task(self._tavily_research_bundle(question)),
+                asyncio.create_task(self._perplexity_research(question)),
+                asyncio.create_task(
+                    self._openrouter_model_research(question, _OPENROUTER_PERPLEXITY_MODEL, "OpenRouter Perplexity")
+                ),
+                asyncio.create_task(
+                    self._openrouter_model_research(question, _GPT_MODEL, "OpenRouter GPT-5 Search")
+                ),
+                asyncio.create_task(self._sonar_pro_research(question)),
+            ]
+            results = await asyncio.gather(*research_tasks, return_exceptions=True)
+
+            research_blocks = []
+            labels = [
+                "Tavily web research",
+                "Perplexity research",
+                "OpenRouter Perplexity research",
+                "OpenRouter GPT-5 search",
+                "Sonar Pro research",
+            ]
+            for label, result in zip(labels, results):
+                if isinstance(result, Exception):
+                    research_blocks.append(f"--- {label} ---\n- {type(result).__name__}: {result}")
+                elif isinstance(result, str) and result.strip():
+                    research_blocks.append(f"--- {label} ---\n{result.strip()}")
+
+            if research_blocks:
                 research = clean_indents(
                     f"""
                     {base}
 
-                    --- TAVILY WEB RESEARCH (SNIPPETS) ---
-                    {tavily_bundle}
+                    {"\n\n".join(research_blocks)}
                     """
                 ).strip()
             else:
@@ -411,27 +560,17 @@ class Chineme(ForecastBot):
             )
             try:
                 summary = await self._llm_invoke("summarizer", summarize_prompt)
-                if tavily_bundle:
-                    final = clean_indents(
-                        f"""
-                        {base}
+                final = clean_indents(
+                    f"""
+                    {base}
 
-                        --- RESEARCH SUMMARY ---
-                        {summary}
+                    --- RESEARCH SUMMARY ---
+                    {summary}
 
-                        --- RAW RESEARCH SNIPPETS ---
-                        {tavily_bundle}
-                        """
-                    ).strip()
-                else:
-                    final = clean_indents(
-                        f"""
-                        {base}
-
-                        --- RESEARCH SUMMARY ---
-                        {summary}
-                        """
-                    ).strip()
+                    --- RAW RESEARCH SNIPPETS ---
+                    {"\n\n".join(research_blocks)}
+                    """
+                ).strip()
             except Exception:
                 final = research
 
@@ -1003,22 +1142,30 @@ if __name__ == "__main__":
     client = MetaculusClient()
 
     if run_mode == "tournament":
-        seasonal_tournament_reports = asyncio.run(
-            chineme.forecast_on_tournament(
-                client.CURRENT_AI_COMPETITION_ID, return_exceptions=True
+        (
+            seasonal_tournament_reports,
+            minibench_reports,
+            market_pulse_q1_reports,
+            market_pulse_q2_reports,
+        ) = asyncio.run(
+            asyncio.gather(
+                chineme.forecast_on_tournament(33022, return_exceptions=True),
+                chineme.forecast_on_tournament(client.CURRENT_MINIBENCH_ID, return_exceptions=True),
+                chineme.forecast_on_tournament("market-pulse-26q1", return_exceptions=True),
+                chineme.forecast_on_tournament("market-pulse-26q2", return_exceptions=True),
             )
         )
-        minibench_reports = asyncio.run(
-            chineme.forecast_on_tournament(
-                client.CURRENT_MINIBENCH_ID, return_exceptions=True
-            )
-        )
-        market_pulse_reports = asyncio.run(
-            chineme.forecast_on_tournament(
-                "market-pulse-26q1", return_exceptions=True
-            )
-        )
-        forecast_reports = seasonal_tournament_reports + minibench_reports + market_pulse_reports
+        forecast_reports = []
+        for reports in [
+            seasonal_tournament_reports,
+            minibench_reports,
+            market_pulse_q1_reports,
+            market_pulse_q2_reports,
+        ]:
+            if isinstance(reports, list):
+                forecast_reports.extend(reports)
+            elif isinstance(reports, Exception):
+                logger.exception("Tournament run failed", exc_info=reports)
 
     elif run_mode == "metaculus_cup":
         chineme.skip_previously_forecasted_questions = False
