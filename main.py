@@ -538,11 +538,12 @@ class Chineme(ForecastBot):
                     research_blocks.append(f"--- {label} ---\n{result.strip()}")
 
             if research_blocks:
+                research_blocks_joined = "\n\n".join(research_blocks)
                 research = clean_indents(
                     f"""
                     {base}
 
-                    {"\n\n".join(research_blocks)}
+                    {research_blocks_joined}
                     """
                 ).strip()
             else:
