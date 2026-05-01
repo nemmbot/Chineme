@@ -559,8 +559,10 @@ class Chineme(ForecastBot):
                 {research}
                 """
             )
-            try:
+                try:
                 summary = await self._llm_invoke("summarizer", summarize_prompt)
+                joined_blocks = "\n\n".join(research_blocks)
+                
                 final = clean_indents(
                     f"""
                     {base}
@@ -569,7 +571,7 @@ class Chineme(ForecastBot):
                     {summary}
 
                     --- RAW RESEARCH SNIPPETS ---
-                    {"\n\n".join(research_blocks)}
+                    {joined_blocks}
                     """
                 ).strip()
             except Exception:
@@ -578,6 +580,7 @@ class Chineme(ForecastBot):
             self._research_cache[question.page_url] = final
             logger.info(f"[Chineme] Research for {question.page_url}:\n{final}")
             return final
+
 
     # ------------------------------------------------------------------
     # Binary
