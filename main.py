@@ -559,7 +559,7 @@ class Chineme(ForecastBot):
                 {research}
                 """
             )
-                try:
+            try:
                 summary = await self._llm_invoke("summarizer", summarize_prompt)
                 joined_blocks = "\n\n".join(research_blocks)
                 
