@@ -44,8 +44,8 @@ logger = logging.getLogger(__name__)
 # Model identifiers
 # ---------------------------------------------------------------------------
 _CLAUDE_MODEL = "openrouter/anthropic/claude-sonnet-4-6"
-_GPT_MODEL    = "openrouter/openai/gpt-5.4"
-_OPENROUTER_PERPLEXITY_MODEL = "openrouter/perplexity"
+_GPT_MODEL    = "openrouter/openai/gpt-5.1"
+_OPENROUTER_PERPLEXITY_MODEL = "openrouter/perplexity/sonar"
 
 
 def _post_json(url: str, payload: dict[str, Any], headers: dict[str, str] | None = None, timeout_s: int = 30) -> dict[str, Any]:
