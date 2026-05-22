@@ -9,7 +9,6 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Literal
-from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 import dotenv
@@ -43,12 +42,18 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Model identifiers
 # ---------------------------------------------------------------------------
-_CLAUDE_MODEL = "openrouter/anthropic/claude-sonnet-4-6"
-_GPT_MODEL    = "openrouter/openai/gpt-5.1"
-_OPENROUTER_PERPLEXITY_MODEL = "openrouter/perplexity/sonar"
+_CLAUDE_MODEL                  = "openrouter/anthropic/claude-sonnet-4-5"
+_GPT_MODEL                     = "openrouter/openai/gpt-5.1"
+_PERPLEXITY_SONAR_PRO_MODEL       = "openrouter/perplexity/sonar-pro"
+_PERPLEXITY_SONAR_REASONING_MODEL = "openrouter/perplexity/sonar-reasoning"
 
 
-def _post_json(url: str, payload: dict[str, Any], headers: dict[str, str] | None = None, timeout_s: int = 30) -> dict[str, Any]:
+def _post_json(
+    url: str,
+    payload: dict[str, Any],
+    headers: dict[str, str] | None = None,
+    timeout_s: int = 30,
+) -> dict[str, Any]:
     data = json.dumps(payload).encode("utf-8")
     headers = headers or {}
     headers.setdefault("Content-Type", "application/json")
@@ -107,7 +112,9 @@ class TavilySearcher:
             payload["include_domains"] = self.include_domains
         if self.exclude_domains:
             payload["exclude_domains"] = self.exclude_domains
-        return await asyncio.to_thread(self._post_json, "https://api.tavily.com/search", payload)
+        return await asyncio.to_thread(
+            self._post_json, "https://api.tavily.com/search", payload
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -119,16 +126,11 @@ class ExtremizationConfig:
     """
     Conservative floor/ceil preserve Metaculus scoring validity while the
     logit factor aggressively separates signal from noise.
-
-    Defaults (env-overridable):
-      factor : 1.45   â€” strong logit push toward confident forecasts
-      floor  : 0.02   â€” never go below 2 % (avoids log-score blowup)
-      ceil   : 0.98   â€” never exceed 98 %
     """
     enabled: bool = True
-    factor: float = 1.45   # was 1.25 â€” more aggressive
-    floor: float = 0.02    # was 0.01 â€” slightly more conservative
-    ceil: float = 0.98     # was 0.99 â€” slightly more conservative
+    factor: float = 1.45
+    floor: float = 0.02
+    ceil: float = 0.98
 
 
 def _logit(p: float) -> float:
@@ -154,15 +156,16 @@ def extremize_probability(p: float, cfg: ExtremizationConfig) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Main bot class â€” Chineme
+# Main bot class — Chineme
 # ---------------------------------------------------------------------------
 
 class Chineme(ForecastBot):
     """
-    Chineme â€” a conservative-yet-extremizing superforecaster bot.
+    Chineme — a conservative-yet-extremizing superforecaster bot.
 
-    Primary reasoning  : Claude Sonnet 4.6  (via OpenRouter)
-    Secondary / parser : GPT-5.4            (via OpenRouter)
+    Primary reasoning  : Claude Sonnet 4.5  (via OpenRouter)
+    Secondary / parser : GPT-5.1            (via OpenRouter)
+    Research           : Perplexity Sonar Pro + Sonar Reasoning (via OpenRouter)
     Extremization      : logit factor 1.45, floor 0.02, ceil 0.98
     """
 
@@ -179,14 +182,12 @@ class Chineme(ForecastBot):
     def __init__(self, *args, **kwargs):
         llms = kwargs.pop("llms", None)
         if llms is None:
-            # Primary: Claude Sonnet 4.6 for deep reasoning (low temperature = conservative)
             claude_llm = GeneralLlm(
                 model=_CLAUDE_MODEL,
                 temperature=0.15,
                 timeout=60,
                 allowed_tries=2,
             )
-            # Secondary: GPT-5.4 for parsing / structured output
             gpt_llm = GeneralLlm(
                 model=_GPT_MODEL,
                 temperature=0.15,
@@ -194,18 +195,17 @@ class Chineme(ForecastBot):
                 allowed_tries=2,
             )
             llms = {
-                "default":    claude_llm,   # main forecasting reasoning
-                "summarizer": claude_llm,   # research summarization
-                "researcher": gpt_llm,      # query decomposition
-                "parser":     gpt_llm,      # structured output parsing
+                "default":    claude_llm,
+                "summarizer": claude_llm,
+                "researcher": gpt_llm,
+                "parser":     gpt_llm,
             }
         super().__init__(*args, llms=llms, **kwargs)
 
         self._research_cache: dict[str, str] = {}
         self._tavily_api_key = os.getenv("TAVILY_API_KEY", "").strip()
         self._openrouter_api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
-        self._perplexity_api_key = os.getenv("PERPLEXITY_API_KEY", "").strip()
-        self._sonar_pro_api_key = os.getenv("SONAR_PRO_API_KEY", "").strip()
+
         self._tavily = TavilySearcher(
             api_key=self._tavily_api_key,
             max_results=6,
@@ -245,27 +245,21 @@ class Chineme(ForecastBot):
         return await self.get_llm(model_key, "llm").invoke(prompt)
 
     # ------------------------------------------------------------------
-    # Superforecasting heuristics â€” injected into every forecast prompt
+    # Superforecasting heuristics
     # ------------------------------------------------------------------
 
     @staticmethod
     def _superforecasting_preamble() -> str:
-        """
-        A compact, reusable block of superforecasting heuristics drawn from
-        Tetlock & Gardner's research and Good Judgment Project best practices.
-        Injected at the top of every forecast prompt so Chineme reasons like
-        a disciplined superforecaster before committing to a number.
-        """
         return clean_indents(
             """
-            ## Superforecasting Protocol â€” follow every step before giving a number
+            ## Superforecasting Protocol — follow every step before giving a number
 
             **1. Reference class first (outside view)**
             Identify the broadest reference class this question belongs to.
             What fraction of similar past questions resolved YES (or at the predicted value)?
             Anchor your initial estimate to that base rate.
 
-            **2. Inside view â€” case-specific evidence**
+            **2. Inside view — case-specific evidence**
             Now consider what makes THIS case different from the reference class:
             - Causal drivers pushing toward YES / a higher value
             - Causal drivers pushing toward NO / a lower value
@@ -286,7 +280,7 @@ class Chineme(ForecastBot):
             Has that evidence been adequately weighted?
 
             **6. Synthesise: blend outside view + inside view**
-            Start from the base rate, then adjust â€” usually by less than feels natural.
+            Start from the base rate, then adjust — usually by less than feels natural.
             Only move far from the base rate if you have strong, specific, reliable evidence.
 
             **7. Express calibrated confidence**
@@ -297,7 +291,7 @@ class Chineme(ForecastBot):
         ).strip()
 
     # ------------------------------------------------------------------
-    # Research
+    # Research helpers
     # ------------------------------------------------------------------
 
     async def _decompose_question(self, question: MetaculusQuestion) -> list[str]:
@@ -306,7 +300,8 @@ class Chineme(ForecastBot):
             You are helping build a research plan for forecasting.
 
             Return 3 to 5 web-search queries that would most improve a forecast for the question below.
-            Queries should be short, specific, and cover: base rates, key drivers, timelines/milestones, and prediction markets if relevant.
+            Queries should be short, specific, and cover: base rates, key drivers, timelines/milestones,
+            and prediction markets if relevant.
             Output ONLY a JSON array of strings.
 
             Question:
@@ -356,115 +351,61 @@ class Chineme(ForecastBot):
                     lines.append(f"  Notes: {snippet}")
         return "\n".join(lines).strip()
 
-    async def _openrouter_model_research(self, question: MetaculusQuestion, model: str, label: str) -> str:
+    async def _openrouter_research(
+        self,
+        question: MetaculusQuestion,
+        model: str,
+        label: str,
+        system_prompt: str | None = None,
+    ) -> str:
+        """Generic OpenRouter research call — used for all model-based research."""
         if not self._openrouter_api_key:
-            return ""
-        prompt = clean_indents(
+            return f"{label}: No OPENROUTER_API_KEY set."
+
+        user_prompt = clean_indents(
             f"""
-            You are a research assistant.
-            Search for the most relevant evidence, data, and market signals for the forecasting question below.
-            Return a concise, evidence-focused summary with any useful citations or indicators.
+            Search for the most relevant evidence, data, and market signals for the forecasting
+            question below. Return a concise, evidence-focused summary with any useful citations
+            or probability indicators found.
 
             Question:
             {question.question_text}
+
+            Resolution criteria:
+            {question.resolution_criteria}
             """
         ).strip()
+
         payload = {
-            "model": model,
+            "model": model.replace("openrouter/", ""),   # OpenRouter REST wants bare model id
             "messages": [
-                {"role": "system", "content": "You are a helpful research assistant for forecasting."},
-                {"role": "user", "content": prompt},
+                {
+                    "role": "system",
+                    "content": system_prompt
+                    or "You are a helpful research assistant for forecasting. Search the web and return concise, evidence-rich summaries.",
+                },
+                {"role": "user", "content": user_prompt},
             ],
             "temperature": 0.2,
-            "max_tokens": 650,
+            "max_tokens": 800,
         }
         try:
             response = await asyncio.to_thread(
                 _post_json,
-                "https://openrouter.ai/v1/chat/completions",
+                "https://openrouter.ai/api/v1/chat/completions",
                 payload,
                 {"Authorization": f"Bearer {self._openrouter_api_key}"},
-                40,
+                45,
             )
-            return (
+            content = (
                 response.get("choices", [{}])[0]
                 .get("message", {})
                 .get("content", "")
                 .strip()
             )
+            return content if content else f"{label}: Empty response."
         except Exception as exc:
-            return f"OpenRouter {label} error: {type(exc).__name__}: {exc}"
-
-    async def _perplexity_research(self, question: MetaculusQuestion) -> str:
-        if not self._perplexity_api_key:
-            return ""
-        prompt = clean_indents(
-            f"""
-            Use your search and evidence-gathering capability to answer the forecasting question below.
-            Provide the most relevant data, market signals, and summary evidence.
-
-            Question:
-            {question.question_text}
-            """
-        ).strip()
-        payload = {
-            "model": "llama-3.1-sonar-huge-128k-online",
-            "messages": [
-                {"role": "system", "content": "You are a research assistant with access to Perplexity search."},
-                {"role": "user", "content": prompt},
-            ],
-            "temperature": 0.2,
-            "stream": False,
-        }
-        try:
-            response = await asyncio.to_thread(
-                _post_json,
-                "https://api.perplexity.ai/chat/completions",
-                payload,
-                {"Authorization": f"Bearer {self._perplexity_api_key}"},
-                40,
-            )
-            return (
-                response.get("choices", [{}])[0]
-                .get("message", {})
-                .get("content", "")
-                .strip()
-            )
-        except Exception as exc:
-            return f"Perplexity error: {type(exc).__name__}: {exc}"
-
-    async def _sonar_pro_research(self, question: MetaculusQuestion) -> str:
-        if not self._sonar_pro_api_key:
-            return ""
-        payload = {
-            "query": question.question_text,
-            "top_k": 5,
-        }
-        try:
-            response = await asyncio.to_thread(
-                _post_json,
-                "https://api.sonar.so/v1/search",
-                payload,
-                {"Authorization": f"Bearer {self._sonar_pro_api_key}"},
-                40,
-            )
-            items = response.get("results") or response.get("data") or []
-            lines = [f"Query: {question.question_text}"]
-            for item in items[:5]:
-                title = (item.get("title") or item.get("name") or "").strip()
-                url = (item.get("url") or item.get("link") or "").strip()
-                snippet = (item.get("snippet") or item.get("summary") or "").strip()
-                if title or url or snippet:
-                    lines.append(f"- {title}".strip())
-                    if url:
-                        lines.append(f"  URL: {url}")
-                    if snippet:
-                        lines.append(f"  Notes: {snippet}")
-            if len(lines) == 1:
-                return "No Sonar Pro results returned."
-            return "\n".join(lines).strip()
-        except Exception as exc:
-            return f"Sonar Pro error: {type(exc).__name__}: {exc}"
+            return f"{label} error: {type(exc).__name__}: {exc}"
 
     async def _tavily_research_bundle(self, question: MetaculusQuestion) -> str:
         if not self._tavily_api_key:
@@ -492,6 +433,10 @@ class Chineme(ForecastBot):
                 blocks.append(f"Query: {q}\n- Search failed: {type(e).__name__}")
         return "\n\n".join([b for b in blocks if b.strip()]).strip()
 
+    # ------------------------------------------------------------------
+    # Research — parallel pipeline
+    # ------------------------------------------------------------------
+
     async def run_research(self, question: MetaculusQuestion) -> str:
         async with self._concurrency_limiter:
             if question.page_url in self._research_cache:
@@ -510,30 +455,53 @@ class Chineme(ForecastBot):
                 """
             ).strip()
 
+            # All four research sources run in parallel
             research_tasks = [
                 asyncio.create_task(self._tavily_research_bundle(question)),
-                asyncio.create_task(self._perplexity_research(question)),
                 asyncio.create_task(
-                    self._openrouter_model_research(question, _OPENROUTER_PERPLEXITY_MODEL, "OpenRouter Perplexity")
+                    self._openrouter_research(
+                        question,
+                        _PERPLEXITY_SONAR_PRO_MODEL,
+                        "Perplexity Sonar Pro",
+                        "You are a research assistant with web search. Find the most relevant "
+                        "current evidence, base rates, and expert opinion for the forecasting question.",
+                    )
                 ),
                 asyncio.create_task(
-                    self._openrouter_model_research(question, _GPT_MODEL, "OpenRouter GPT-5 Search")
+                    self._openrouter_research(
+                        question,
+                        _PERPLEXITY_SONAR_REASONING_MODEL,
+                        "Perplexity Sonar Reasoning",
+                        "You are an analytical research assistant. Reason carefully about the "
+                        "forecasting question using web search. Identify base rates, key drivers, "
+                        "and any market probability signals.",
+                    )
                 ),
-                asyncio.create_task(self._sonar_pro_research(question)),
+                asyncio.create_task(
+                    self._openrouter_research(
+                        question,
+                        _GPT_MODEL,
+                        "GPT-5.1 Search",
+                        "You are a research assistant. Search for the most up-to-date information "
+                        "relevant to this forecasting question and provide a concise evidence summary.",
+                    )
+                ),
             ]
             results = await asyncio.gather(*research_tasks, return_exceptions=True)
 
-            research_blocks = []
             labels = [
                 "Tavily web research",
-                "Perplexity research",
-                "OpenRouter Perplexity research",
-                "OpenRouter GPT-5 search",
-                "Sonar Pro research",
+                "Perplexity Sonar Pro research",
+                "Perplexity Sonar Reasoning research",
+                "GPT-5.1 search research",
             ]
+
+            research_blocks: list[str] = []
             for label, result in zip(labels, results):
                 if isinstance(result, Exception):
-                    research_blocks.append(f"--- {label} ---\n- {type(result).__name__}: {result}")
+                    research_blocks.append(
+                        f"--- {label} ---\n- {type(result).__name__}: {result}"
+                    )
                 elif isinstance(result, str) and result.strip():
                     research_blocks.append(f"--- {label} ---\n{result.strip()}")
 
@@ -553,7 +521,8 @@ class Chineme(ForecastBot):
                 f"""
                 You are an assistant to a superforecaster.
                 Summarize the most relevant evidence for forecasting the question below.
-                Include: status quo, key drivers, base rates if any, timelines/milestones, and any market probabilities found.
+                Include: status quo, key drivers, base rates if any, timelines/milestones,
+                and any market probabilities found.
                 Be concise but information-dense.
 
                 {research}
@@ -562,7 +531,6 @@ class Chineme(ForecastBot):
             try:
                 summary = await self._llm_invoke("summarizer", summarize_prompt)
                 joined_blocks = "\n\n".join(research_blocks)
-                
                 final = clean_indents(
                     f"""
                     {base}
@@ -580,7 +548,6 @@ class Chineme(ForecastBot):
             self._research_cache[question.page_url] = final
             logger.info(f"[Chineme] Research for {question.page_url}:\n{final}")
             return final
-
 
     # ------------------------------------------------------------------
     # Binary
@@ -619,7 +586,7 @@ class Chineme(ForecastBot):
             (c) Status quo outcome if nothing changes (outside view anchor)
             (d) Inside-view: key YES drivers
             (e) Inside-view: key NO drivers
-            (f) Bias check â€” what am I most likely wrong about?
+            (f) Bias check — what am I most likely wrong about?
             (g) Final synthesis: blend outside + inside view
 
             Weight the status quo heavily unless there is strong, specific evidence of change.
@@ -645,7 +612,6 @@ class Chineme(ForecastBot):
             num_validation_samples=self._structure_output_validation_samples,
         )
         raw_p = max(0.01, min(0.99, binary_prediction.prediction_in_decimal))
-        # Extremize individual binary prediction before returning
         extremized_p = extremize_probability(raw_p, self._ext_cfg)
         return ReasonedPrediction(prediction_value=extremized_p, reasoning=reasoning)
 
@@ -688,7 +654,7 @@ class Chineme(ForecastBot):
             (c) Status quo anchor: which option does the current trajectory favour?
             (d) Inside-view drivers that could shift away from the status quo option
             (e) Plausible surprise outcome and why it shouldn't be assigned zero probability
-            (f) Bias check â€” am I clustering too much probability on one option?
+            (f) Bias check — am I clustering too much probability on one option?
 
             {self._get_conditional_disclaimer_if_necessary(question)}
             Put extra weight on the status quo option, but leave meaningful probability mass for surprises.
@@ -777,7 +743,7 @@ class Chineme(ForecastBot):
             (e) Inside-view: factors that could push the value lower than the trend
             (f) Expert or market expectations (if found in research)
             (g) Tail scenarios: extreme low and extreme high (use these to calibrate your 10th/90th)
-            (h) Bias check â€” are my intervals too narrow (overconfidence)?
+            (h) Bias check — are my intervals too narrow (overconfidence)?
 
             {self._get_conditional_disclaimer_if_necessary(question)}
             Use wide 90/10 intervals to reflect genuine uncertainty.
@@ -867,7 +833,7 @@ class Chineme(ForecastBot):
             (e) Inside-view: factors that could delay the timeline
             (f) Expert or market expectations on timing (if found in research)
             (g) Tail scenarios: unusually early and unusually late (calibrate 10th/90th)
-            (h) Bias check â€” am I anchoring too tightly to the most salient date?
+            (h) Bias check — am I anchoring too tightly to the most salient date?
 
             {self._get_conditional_disclaimer_if_necessary(question)}
             Use wide 90/10 intervals to reflect genuine timing uncertainty.
@@ -982,7 +948,6 @@ class Chineme(ForecastBot):
             question.question_no, full_research, "no"
         )
 
-        # Extremize binary sub-predictions inside conditionals
         for info in [parent_info, child_info, yes_info, no_info]:
             pv = getattr(info, "prediction_value", None)
             if isinstance(pv, float):
@@ -1075,11 +1040,10 @@ class Chineme(ForecastBot):
         ).strip()
 
     # ------------------------------------------------------------------
-    # Extremization â€” top-level sweep
+    # Extremization — top-level sweep
     # ------------------------------------------------------------------
 
     def _extremize_report_if_binary(self, report: Any) -> None:
-        """Apply extremization to any float probability found on a report object."""
         try:
             pv = getattr(report, "prediction_value", None)
             if isinstance(pv, float):
@@ -1122,7 +1086,7 @@ if __name__ == "__main__":
     litellm_logger.setLevel(logging.WARNING)
     litellm_logger.propagate = False
 
-    parser = argparse.ArgumentParser(description="Run Chineme â€” the superforecaster bot")
+    parser = argparse.ArgumentParser(description="Run Chineme — the superforecaster bot")
     parser.add_argument(
         "--mode",
         type=str,
