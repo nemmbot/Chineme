@@ -42,7 +42,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Model identifiers
 # ---------------------------------------------------------------------------
-_CLAUDE_MODEL                  = "openrouter/anthropic/claude-sonnet-4-5"
+_CLAUDE_MODEL                  = "openrouter/anthropic/claude-sonnet-4.5"
 _GPT_MODEL                     = "openrouter/openai/gpt-5.1"
 _PERPLEXITY_SONAR_PRO_MODEL       = "openrouter/perplexity/sonar-pro"
 _PERPLEXITY_SONAR_REASONING_MODEL = "openrouter/perplexity/sonar-reasoning"
