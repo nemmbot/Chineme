@@ -1,8 +1,4 @@
 # main.py
-# Conservative Hybrid Forecasting Bot — Tournament-Only, OpenRouter-Only
-# Structure : ConservativeHybridBot committee (3-model median)
-# Research  : Tavily web search + OpenRouter LLM committee
-# Extras    : DateQuestion, ConditionalQuestion, extremization, superforecasting preamble
 
 import argparse
 import asyncio
@@ -52,14 +48,14 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
 # -----------------------------
 # Models (all via OpenRouter)
 # -----------------------------
-_MODEL_PRIMARY = "openrouter/openai/gpt-5.5"
+_MODEL_PRIMARY = "openrouter/openai/o3"
 _MODEL_PARSER  = "openrouter/openai/gpt-4.1-mini"
 
 # Committee: each question is forecast by all three; median is taken
 _COMMITTEE_MODELS = [
     "openrouter/openai/gpt-5.1",
-    "openrouter/openai/gpt-5.5",
-    "openrouter/anthropic/claude-sonnet-4.5",
+    "openrouter/openai/o4-mini",
+    "openrouter/openai/o3",
 ]
 
 # -----------------------------
@@ -898,7 +894,7 @@ if __name__ == "__main__":
         research_reports_per_question=1,
         predictions_per_research_report=1,
         publish_reports_to_metaculus=True,
-        skip_previously_forecasted_questions=True,
+        skip_previously_forecasted_questions=False,
     )
 
     try:
