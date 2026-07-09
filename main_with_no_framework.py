@@ -23,9 +23,9 @@ This file provides a simple forecasting bot built from the ground up.
 We provide this for people who want to dissect
 it to build their own bot without using forecasting-tools.
 
-This template assumes you are using a OpenAI model and have an OpenAI API key
-You will also need a Metaculus API key, for posting questions to Metaculus
-and a Perplexity or AskNews API key for online research
+This template uses Vultr Serverless Inference for all LLM calls (OpenAI-compatible API).
+You will also need a Metaculus API key for posting questions to Metaculus
+and optionally Tavily, AskNews, Exa, or Perplexity keys for online research
 
 This is not a representative of the template bots used by Metaculus, as there are some
 differences in implementation. The actual template bot (e.g. like main.py) has the following differences:
@@ -64,7 +64,11 @@ ASKNEWS_SECRET = os.getenv("ASKNEWS_SECRET")
 EXA_API_KEY = os.getenv("EXA_API_KEY")
 OPENAI_API_KEY = os.getenv(
     "OPENAI_API_KEY"
-)  # You'll also need the OpenAI API Key if you want to use the Exa Smart Searcher
+)  # Used by Exa SmartSearcher only (optional)
+VULTR_SERVERLESS_INFERENCE_API_KEY = os.getenv("VULTR_SERVERLESS_INFERENCE_API_KEY")
+VULTR_API_BASE = "https://api.vultrinference.com/v1"
+VULTR_DEFAULT_MODEL = "llama-3.3-70b-instruct-fp8"
+VULTR_RESEARCH_MODEL = "qwen2.5-32b-instruct"
 
 # The tournament IDs below can be used for testing your bot.
 Q4_2024_AI_BENCHMARKING_ID = 32506
@@ -255,15 +259,18 @@ CONCURRENT_REQUESTS_LIMIT = 5
 llm_rate_limiter = asyncio.Semaphore(CONCURRENT_REQUESTS_LIMIT)
 
 
-async def call_llm(prompt: str, model: str = "gpt-4o", temperature: float = 0.3) -> str:
+async def call_llm(
+    prompt: str,
+    model: str = VULTR_DEFAULT_MODEL,
+    temperature: float = 0.3,
+) -> str:
     """
-    Makes a streaming completion request to OpenAI's API with concurrent request limiting.
+    Makes a completion request via Vultr Serverless Inference (OpenAI-compatible API).
     """
-
-    # Remove the base_url parameter to call the OpenAI API directly
-    # Also checkout the package 'litellm' for one function that can call any model from any provider
-    # Also checkout OpenRouter for allowing one API key for many providers (especially powerful if combined with litellm)
-    client = AsyncOpenAI()
+    client = AsyncOpenAI(
+        api_key=VULTR_SERVERLESS_INFERENCE_API_KEY,
+        base_url=VULTR_API_BASE,
+    )
 
     async with llm_rate_limiter:
         response = await client.chat.completions.create(
@@ -297,18 +304,18 @@ def run_research(question: str) -> str:
 
 
 def call_perplexity(question: str) -> str:
-    url = "https://api.perplexity.ai/chat/completions"
-    api_key = PERPLEXITY_API_KEY
+    """Research assistant via Vultr Serverless Inference (replaces Perplexity Sonar)."""
+    url = f"{VULTR_API_BASE}/chat/completions"
     headers = {
         "accept": "application/json",
-        "authorization": f"Bearer {api_key}",
+        "authorization": f"Bearer {VULTR_SERVERLESS_INFERENCE_API_KEY}",
         "content-type": "application/json",
     }
     payload = {
-        "model": "llama-3.1-sonar-huge-128k-online",
+        "model": VULTR_RESEARCH_MODEL,
         "messages": [
             {
-                "role": "system",  # this is a system prompt designed to guide the perplexity assistant
+                "role": "system",
                 "content": """
                 You are an assistant to a superforecaster.
                 The superforecaster will give you a question they intend to forecast on.
@@ -317,7 +324,7 @@ def call_perplexity(question: str) -> str:
                 """,
             },
             {
-                "role": "user",  # this is the actual prompt we ask the perplexity assistant to answer
+                "role": "user",
                 "content": question,
             },
         ],
