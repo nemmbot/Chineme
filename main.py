@@ -70,6 +70,9 @@ def _make_vultr_llm(model_id: str, **kwargs) -> GeneralLlm:
         model=f"openai/{model_id}",
         api_key=VULTR_SERVERLESS_INFERENCE_API_KEY,
         base_url=VULTR_API_BASE,
+        # GeneralLlm strips the openai/ prefix before calling litellm; without an
+        # explicit provider, litellm cannot route custom-base-url models.
+        custom_llm_provider="openai",
         **kwargs,
     )
 
