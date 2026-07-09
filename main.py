@@ -901,7 +901,7 @@ if __name__ == "__main__":
         type=str,
         default=[
             "33022",
-            "market-pulse-26q2",
+            "market-pulse-26q3",
             MetaculusApi.CURRENT_MINIBENCH_ID,
         ],
     )
