@@ -42,21 +42,36 @@ dotenv.load_dotenv()
 # -----------------------------
 # Environment & API Keys
 # -----------------------------
-TAVILY_API_KEY     = os.getenv("TAVILY_API_KEY", "").strip()
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "").strip()
+VULTR_SERVERLESS_INFERENCE_API_KEY = os.getenv(
+    "VULTR_SERVERLESS_INFERENCE_API_KEY", ""
+).strip()
+VULTR_API_BASE = "https://api.vultrinference.com/v1"
 
 # -----------------------------
-# Models (all via OpenRouter)
+# Models (all via Vultr Serverless Inference)
+# See https://api.vultrinference.com/v1/models for the full catalog.
 # -----------------------------
-_MODEL_PRIMARY = "openrouter/openai/o3"
-_MODEL_PARSER  = "openrouter/openai/gpt-4.1-mini"
+_MODEL_PRIMARY = "deepseek-r1"
+_MODEL_PARSER = "qwen2.5-32b-instruct"
 
-# Committee: each question is forecast by all three; median is taken
+# Committee: each question is forecast by all three; median is taken.
+# Use architecturally diverse models to reduce correlated errors.
 _COMMITTEE_MODELS = [
-    "openrouter/openai/gpt-5.1",
-    "openrouter/openai/o4-mini",
-    "openrouter/openai/o3",
+    "deepseek-r1",
+    "llama-3.3-70b-instruct-fp8",
+    "qwen2.5-32b-instruct",
 ]
+
+
+def _make_vultr_llm(model_id: str, **kwargs) -> GeneralLlm:
+    """Create a GeneralLlm routed through Vultr's OpenAI-compatible API."""
+    return GeneralLlm(
+        model=f"openai/{model_id}",
+        api_key=VULTR_SERVERLESS_INFERENCE_API_KEY,
+        base_url=VULTR_API_BASE,
+        **kwargs,
+    )
 
 # -----------------------------
 # Logging
@@ -143,8 +158,8 @@ class ConservativeHybridBot(ForecastBot):
     """
     Conservative forecasting bot.
 
-    Research    : Tavily + Perplexity + OpenRouter (GPT-5 / Perplexity) + Sonar Pro
-    Committee   : 3-model vote → median aggregation
+    Research    : Tavily web search + Vultr LLM summarization
+    Committee   : 3-model Vultr vote → median aggregation
     Question types: Binary, MultipleChoice, Numeric, Date, Conditional
     Extras      : Superforecasting preamble, extremization (logit factor 1.45)
     """
@@ -165,10 +180,12 @@ class ConservativeHybridBot(ForecastBot):
     def __init__(self, *args, **kwargs):
         llms = kwargs.pop("llms", None)
         if llms is None:
-            primary_llm = GeneralLlm(model=_MODEL_PRIMARY,  temperature=0.15,
-                                     timeout=60, allowed_tries=2)
-            parser_llm  = GeneralLlm(model=_MODEL_PARSER,   temperature=0.15,
-                                     timeout=60, allowed_tries=2)
+            primary_llm = _make_vultr_llm(
+                _MODEL_PRIMARY, temperature=0.15, timeout=120, allowed_tries=2
+            )
+            parser_llm = _make_vultr_llm(
+                _MODEL_PARSER, temperature=0.15, timeout=60, allowed_tries=2
+            )
             llms = {
                 "default":    primary_llm,
                 "summarizer": primary_llm,
@@ -436,8 +453,8 @@ class ConservativeHybridBot(ForecastBot):
     ):
         """Run one forecast with the given model; returns (prediction, reasoning)."""
         original_default = self._llms.get("default")
-        self._llms["default"] = GeneralLlm(
-            model=model_override, temperature=0.15, timeout=60, allowed_tries=2
+        self._llms["default"] = _make_vultr_llm(
+            model_override, temperature=0.15, timeout=120, allowed_tries=2
         )
 
         try:
@@ -894,7 +911,7 @@ if __name__ == "__main__":
         research_reports_per_question=1,
         predictions_per_research_report=1,
         publish_reports_to_metaculus=True,
-        skip_previously_forecasted_questions=False,
+        skip_previously_forecasted_questions=True,
     )
 
     try:
