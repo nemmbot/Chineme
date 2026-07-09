@@ -37,6 +37,13 @@ from forecasting_tools import (
     structure_output,
 )
 
+from prediction_markets import (
+    aggregate_market_signal,
+    blend_with_market,
+    fetch_polymarket_signals,
+    format_market_context,
+)
+
 dotenv.load_dotenv()
 
 # -----------------------------
@@ -94,6 +101,23 @@ class ExtremizationConfig:
     factor: float = 1.45
     floor: float  = 0.02
     ceil: float   = 0.98
+    # Only extremize when committee members agree (low std dev)
+    agreement_std_threshold: float = 0.08
+
+
+def maybe_extremize_probability(
+    p: float,
+    committee_forecasts: list[float],
+    cfg: ExtremizationConfig,
+) -> float:
+    """Extremize only when the committee agrees; otherwise return clamped raw value."""
+    clamped = max(cfg.floor, min(cfg.ceil, p))
+    if not cfg.enabled:
+        return clamped
+    if len(committee_forecasts) >= 2:
+        if float(np.std(committee_forecasts)) > cfg.agreement_std_threshold:
+            return clamped
+    return extremize_probability(p, cfg)
 
 
 def _logit(p: float) -> float:
@@ -160,13 +184,14 @@ class ConservativeHybridBot(ForecastBot):
 
     Research    : Tavily web search + Vultr LLM summarization
     Committee   : 3-model Vultr vote → median aggregation
+    Markets     : Polymarket signal blend (free API, no extra research sources)
     Question types: Binary, MultipleChoice, Numeric, Date, Conditional
-    Extras      : Superforecasting preamble, extremization (logit factor 1.45)
+    Extras      : Superforecasting preamble, dynamic extremization on agreement
     """
 
     _max_concurrent_questions = 1
     _concurrency_limiter      = asyncio.Semaphore(_max_concurrent_questions)
-    _structure_output_validation_samples = 2
+    _structure_output_validation_samples = 1  # free-tier: single parser pass
 
     _min_seconds_between_search_calls = 1.2
     _min_seconds_between_llm_calls    = 0.35
@@ -195,14 +220,20 @@ class ConservativeHybridBot(ForecastBot):
         super().__init__(*args, llms=llms, **kwargs)
 
         self._research_cache: dict[str, str] = {}
+        self._market_cache: dict[str, object] = {}
         self._tavily = TavilySearcher(api_key=TAVILY_API_KEY,
                                       max_results=6, timeout_s=25)
+        self._market_blend_weight = float(os.getenv("MARKET_BLEND_WEIGHT", "0.25"))
+        self._market_min_match = float(os.getenv("MARKET_MIN_MATCH_SCORE", "0.20"))
         self._ext_cfg = ExtremizationConfig(
             enabled=os.getenv("EXTREMIZE_ENABLED", "true").lower()
                     in ["1", "true", "yes", "y"],
             factor=float(os.getenv("EXTREMIZE_FACTOR", "1.45")),
             floor=float(os.getenv("EXTREMIZE_FLOOR",   "0.02")),
             ceil=float(os.getenv("EXTREMIZE_CEIL",     "0.98")),
+            agreement_std_threshold=float(
+                os.getenv("EXTREMIZE_AGREEMENT_STD", "0.08")
+            ),
         )
 
     # ------------------------------------------------------------------
@@ -226,6 +257,31 @@ class ConservativeHybridBot(ForecastBot):
     async def _llm_invoke(self, model_key: str, prompt: str) -> str:
         await self._throttle_llm()
         return await self.get_llm(model_key, "llm").invoke(prompt)
+
+    # ------------------------------------------------------------------
+    # Prediction market signals (Polymarket — free, no API key)
+    # ------------------------------------------------------------------
+
+    async def _fetch_polymarket_signals(self, question: MetaculusQuestion):
+        cache_key = question.page_url
+        if cache_key in self._market_cache:
+            return self._market_cache[cache_key]
+
+        signals = await asyncio.to_thread(
+            fetch_polymarket_signals, question.question_text
+        )
+        self._market_cache[cache_key] = signals
+        return signals
+
+    def _resolve_market_signal(
+        self, question: MetaculusQuestion, research: str = ""
+    ):
+        signals = self._market_cache.get(question.page_url, [])
+        return aggregate_market_signal(
+            signals,
+            research_text=research,
+            min_match_score=self._market_min_match,
+        )
 
     # ------------------------------------------------------------------
     # Superforecasting preamble
@@ -361,6 +417,12 @@ class ConservativeHybridBot(ForecastBot):
             research_blocks: list[str] = []
             if tavily_result.strip():
                 research_blocks.append(f"--- Tavily web research ---\n{tavily_result.strip()}")
+
+            signals = await self._fetch_polymarket_signals(question)
+            aggregate = self._resolve_market_signal(question, research="")
+            market_ctx = format_market_context(signals, aggregate)
+            if market_ctx:
+                research_blocks.append(market_ctx)
 
             if not research_blocks:
                 self._research_cache[question.page_url] = base
@@ -682,13 +744,27 @@ class ConservativeHybridBot(ForecastBot):
             reasonings.append(f"[{model}]\n{reason}")
 
         median_pred = float(np.median(forecasts))
-        extremized  = extremize_probability(median_pred, self._ext_cfg)
+
+        market_signal = self._resolve_market_signal(question, research=research)
+
+        blended = blend_with_market(
+            median_pred, market_signal, self._market_blend_weight
+        )
+        final = maybe_extremize_probability(blended, forecasts, self._ext_cfg)
+
+        market_note = ""
+        if market_signal:
+            market_note = (
+                f" market={market_signal.yes_probability:.3f}"
+                f"({market_signal.source})"
+            )
         logger.info(
-            f"Binary  median={median_pred:.3f} → extremized={extremized:.3f} "
-            f"| {question.question_text[:60]}"
+            f"Binary  median={median_pred:.3f} blended={blended:.3f}"
+            f" → final={final:.3f} std={float(np.std(forecasts)):.3f}"
+            f"{market_note} | {question.question_text[:60]}"
         )
         return ReasonedPrediction(
-            prediction_value=extremized,
+            prediction_value=final,
             reasoning=" | ".join(reasonings),
         )
 
@@ -803,11 +879,13 @@ class ConservativeHybridBot(ForecastBot):
             question.question_no, research, "no"
         )
 
-        # Extremize any binary sub-predictions
+        # Dynamic extremize any binary sub-predictions
         for info in [parent_info, child_info, yes_info, no_info]:
             pv = getattr(info, "prediction_value", None)
             if isinstance(pv, float):
-                info.prediction_value = extremize_probability(pv, self._ext_cfg)  # type: ignore[attr-defined]
+                info.prediction_value = maybe_extremize_probability(  # type: ignore[attr-defined]
+                    pv, [pv], self._ext_cfg
+                )
 
         full_reasoning = clean_indents(f"""
             ## Parent Question Reasoning
