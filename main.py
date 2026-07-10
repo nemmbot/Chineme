@@ -64,12 +64,24 @@ _COMMITTEE_MODELS = [
 ]
 
 
+def _resolve_llm_provider_settings() -> tuple[str, str, str]:
+    """Resolve the configured Vultr API credentials."""
+    if VULTR_SERVERLESS_INFERENCE_API_KEY:
+        return "vultr", VULTR_SERVERLESS_INFERENCE_API_KEY, VULTR_API_BASE
+
+    raise RuntimeError(
+        "Missing LLM API credentials. Set VULTR_SERVERLESS_INFERENCE_API_KEY "
+        "in your environment or .env before running."
+    )
+
+
 def _make_vultr_llm(model_id: str, **kwargs) -> GeneralLlm:
     """Create a GeneralLlm routed through Vultr's OpenAI-compatible API."""
+    _, api_key, base_url = _resolve_llm_provider_settings()
     return GeneralLlm(
         model=f"openai/{model_id}",
-        api_key=VULTR_SERVERLESS_INFERENCE_API_KEY,
-        base_url=VULTR_API_BASE,
+        api_key=api_key,
+        base_url=base_url,
         # GeneralLlm strips the openai/ prefix before calling litellm; without an
         # explicit provider, litellm cannot route custom-base-url models.
         custom_llm_provider="openai",
@@ -910,14 +922,14 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    bot = ConservativeHybridBot(
-        research_reports_per_question=1,
-        predictions_per_research_report=1,
-        publish_reports_to_metaculus=True,
-        skip_previously_forecasted_questions=True,
-    )
-
     try:
+        bot = ConservativeHybridBot(
+            research_reports_per_question=1,
+            predictions_per_research_report=1,
+            publish_reports_to_metaculus=True,
+            skip_previously_forecasted_questions=True,
+        )
+
         all_reports = []
         for tid in args.tournament_ids:
             logger.info(f"Forecasting on tournament: {tid}")
